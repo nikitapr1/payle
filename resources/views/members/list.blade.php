@@ -3,7 +3,7 @@
 @section('title', 'Member List')
 
 @section('content')
-    <h1>List of members</h1>
+    <h1>Список участников</h1>
     <div class="member-list">
         <ol>
             @foreach($members as $member)
@@ -18,7 +18,7 @@
                     @csrf
                     </form>
                     </a>
-                    <a href="http://t.me/PayleRuBot?<?=http_build_query(['start' => $member->telegram_start_token])?>">
+                    <a href="<?=$member->telegram_link?>">
                         Ссылка
                     </a>
 

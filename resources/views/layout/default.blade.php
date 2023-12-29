@@ -36,12 +36,10 @@
 <body>
 
 <ul>
-    <li><a href="{{route('members.index')}}">Members List</a></li>
-    <li><a href="{{route('members.create')}}">Members Create</a></li>
-    <li><a href="{{route('payments.index')}}">Payments List</a></li>
-    <li class="hidden"><a href="{{route('payments.create')}}">Payments Create</a></li>
-    <li><a href="{{route('schedules.index')}}">Payments Schedule List</a></li>
-    <li><a href="{{route('schedules.create')}}">Payments Schedule Create</a></li>
+    <li><a href="{{route('members.index')}}">Список участников</a></li>
+    <li><a href="{{route('members.create')}}">Создать участника</a></li>
+    <li><a href="{{route('schedules.index')}}">Список графиков</a></li>
+    <li><a href="{{route('schedules.create')}}">Создать график</a></li>
 
 </ul>
 <br>

@@ -12,4 +12,9 @@ class Member extends Model
 
     protected $guarded = false;
 
+    public function getTelegramLinkAttribute()
+    {
+        return sprintf("http://t.me/PayleRuBot?%s", http_build_query(['start' => $this->telegram_start_token]));
+    }
+
 }

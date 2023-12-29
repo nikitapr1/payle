@@ -3,32 +3,35 @@
 namespace App\Telegram;
 
 use App\Models\Member;
-use App\Models\MessagesSupportHandle;
 use App\Models\Payment;
 use App\Models\PaymentSchedule;
 use App\Services\NextMessageService;
-use DefStudio\Telegraph\Models\TelegraphBot;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
-use DefStudio\Telegraph\Enums\ChatActions;
+use DefStudio\Telegraph\Facades\Telegraph as TelegraphFacade;
 use DefStudio\Telegraph\Handlers\WebhookHandler;
 use DefStudio\Telegraph\Keyboard\Button;
 use DefStudio\Telegraph\Keyboard\Keyboard;
 use DefStudio\Telegraph\Models\TelegraphChat;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Stringable;
-use function Pest\Laravel\json;
+use DateTime;
+use Illuminate\Support\Facades\Log;
 
 class Handler extends WebhookHandler
 {
+
 
     protected function handleChatMessage(Stringable $text): void
     {
         parent::handleChatMessage($text);
 
-        if ($nextMessageHandler = NextMessageService::getNextMessageHandler($this->chat->chat_id, $this->message->text())) {
-            $nextMessageHandler->getHandler()($nextMessageHandler->getData());
+        if ($nextMessageHandler = NextMessageService::getNextStepHandler($this->chat->chat_id)) {
+            call_user_func([$this, $nextMessageHandler->getAction()], $nextMessageHandler->getData(), $text);
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, $nextMessageHandler->getAction());
         }
+    }
+
+    protected function handleUnknownCommand(Stringable $text): void
+    {
+        $this->chat->html("Неизвестная команда.")->send();
     }
 
 
@@ -43,6 +46,107 @@ class Handler extends WebhookHandler
 
     }
 
+    /*public function test(){
+        $this->chat->message('Bla')->keyboard(Keyboard::make()->buttons([
+            Button::make('Вернуться в меню')->action('menu')->param('pMsg', $this->messageId + 1)
+        ]))->send();
+    }*/
+
+   /* public function menu(){
+        $this->checkAuth();
+        $data = $this->data->toArray();
+
+        $keyboard = Keyboard::make()->buttons([
+            Button::make("Посмотреть график платежей")->action('schedule')->param('pMsg', $this->messageId + 1),
+            Button::make("Посмотреть задолженности")->action('check')->param('pMsg', $this->messageId + 1),
+        ]);
+
+        if (!array_key_exists('action', $data)){
+            $this->chat->message("Чем могу Вам помочь?")->keyboard($keyboard)->send();
+            die();
+        }
+        $this->chat->edit($data['pMsg'])->message("Чем могу Вам помочь?")->keyboard($keyboard)->send();
+
+    }*/
+
+
+
+
+    protected function deleteSchedule($data, $id)
+    {
+        if (!($schedule = PaymentSchedule::query()->find($id))) {
+            $this->reply("Такого графика не существует");
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, 'deleteSchedule');
+            die();
+        }
+        $schedule->delete();
+        $this->reply("График удален.");
+    }
+
+
+
+
+
+    public function members()
+    {
+        $this->checkAuth();
+        $answer = '';
+        $members = Member::all();
+        $count = 0;
+        foreach ($members as $member) {
+            $count++;
+            $answer .= sprintf("%s\\. %s %s\\. ChatID: %s \n", $count, $member->name, $member->surname,
+                is_null($member->chat_id) ? "Отсутствует\\. [Ссылка]({$member->telegram_link}) " : $member->chat_id);
+        }
+
+        $this->chat->message($answer)->withData('parse_mode', 'MarkdownV2')->send();
+    }
+
+    public function addMember()
+    {
+        $this->checkAuth();
+
+        $this->reply("Укажите имя нового участника:");
+        NextMessageService::addNextStepHandler($this->chat->chat_id, serialize([]), 'handleMemberFirstName');
+
+    }
+
+    protected function handleMemberFirstName(array $data, $text)
+    {
+        if (!is_string($text)) {
+            $this->reply("Ошибка: неверный ввод.");
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, 'handleMemberFirstName');
+            die();
+        }
+
+        $data['name'] = $text;
+
+
+        $this->reply("Укажите отчество или фамилию нового участника:");
+        NextMessageService::addNextStepHandler($this->chat->chat_id, serialize($data), 'handleMemberSurname');
+    }
+
+    protected function handleMemberSurname(array $data, $text)
+    {
+        if (!is_string($text)){
+            $this->reply("Ошибка: неверный ввод.");
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, 'handleMemberSurname');
+            die();
+        }
+
+        $data['surname'] = $text;
+
+        $this->createMember($data);
+
+    }
+
+    protected function createMember(array $data){
+
+    }
+
+
+
+
     public function confirmPayment()
     {
         $this->checkAuth();
@@ -55,6 +159,8 @@ class Handler extends WebhookHandler
         $this->deleteKeyboard();
 
         $this->chat->message('Платеж подтвержден!')->send();
+        $thisMember = Member::query()->where('chat_id', $this->chat->chat_id)->first();
+        Log::debug(sprintf("%s (%s) подтвердил оплату платежа", $thisMember->name, $thisMember->id));
 
         $usurer = Member::query()->find(PaymentSchedule::query()->find($payment->schedule_id)->usurer);
         $debtor = Member::query()->find(PaymentSchedule::query()->find($payment->schedule_id)->debtor);
@@ -91,6 +197,9 @@ class Handler extends WebhookHandler
         $this->checkAuth();
         $this->deleteKeyboard();
 
+        $data = $this->data->toArray();
+
+
         $usurerId = $this->data->get('usurer');
         $debtorId = $this->data->get('debtor');
 
@@ -103,56 +212,138 @@ class Handler extends WebhookHandler
         $chat->message("{$usurer->name} поблагодарил Вас за перевод")->send();
     }
 
-    public function selectDebtor()
+    public function add()
     {
         $this->checkAuth();
-        $this->deleteKeyboard();
 
-        $usurerId = $this->data->get('usurer');
+        $members = Member::query()->get();
+        $action = 'selectUsurer';
+        $buttons = [];
+        foreach ($members as $member) {
 
+            $buttons[] = Button::make("{$member->name} {$member->surname}")->action($action)
+                ->param('debtor', $member->id)
+                ->param('previousMessage', (int) $this->messageId + 1);
+        }
+
+
+
+        $this->chat->message("Укажите платильщика")->keyboard(Keyboard::make()->buttons($buttons))->send();
+
+    }
+
+
+    public function selectUsurer()
+    {
+        $this->checkAuth();
+        $data = $this->data->toArray();
+        $action = 'selectPeriod';
         $members = Member::query()->get();
         $buttons = [];
 
         foreach ($members as $member) {
-            $buttons[] = Button::make("{$member->name} {$member->surname}")->action('selectPeriod')
-                ->param('usurer', $usurerId)->param('debtor', $member->id);
-
-
+            $buttons[] = Button::make("{$member->name} {$member->surname}")->action($action)
+                ->param('previousMessage', (int) $this->messageId)
+                ->param('usurer', $member->id)
+                ->param('debtor', $data['debtor']);
         }
-        $this->chat->message("Укажите получателя платежа")->keyboard(Keyboard::make()->buttons($buttons))->send();
 
+        $this->chat->edit($this->messageId)->message("Укажите получателя платежа")
+            ->keyboard(Keyboard::make()->buttons($buttons))->send();
 
     }
 
     public function selectPeriod()
     {
         $this->checkAuth();
-        $this->deleteKeyboard();
         $data = $this->data->toArray();
+        $action = 'selectSum';
+        $previousMessageId = (int)$data['previousMessage'];
+        $buttons = [
+            Button::make("Ежемесячный")->action($action)
+            ->param('usurer', $data['usurer'])
+            ->param('debtor', $data['debtor'])
+            ->param('period', 'regular')
+            ->param('pMsg', $previousMessageId),
 
-        $this->chat->message("Укажите тип платежа")->keyboard(Keyboard::make()->buttons([
-            Button::make("Ежемесячный")->action('selectSum')
-                ->param('usurer', $data['usurer'])->param('debtor', $data['debtor'])->param('period', 'regular'),
+            Button::make("Одноразовый")->action($action)
+            ->param('usurer', $data['usurer'])
+            ->param('debtor', $data['debtor'])
+            ->param('period', 'once')
+            ->param('pMsg', $previousMessageId),
 
-            Button::make("Одноразовый")->action('selectSum')
-                ->param('usurer', $data['usurer'])->param('debtor', $data['debtor'])->param('period', 'once')
-
-
-        ]))->send();
+        ];
+       $this->chat->edit($previousMessageId)->message("Укажите тип платежа")->keyboard(Keyboard::make()->buttons($buttons))->send();
 
 
     }
 
     public function selectSum()
     {
+
+
         $this->checkAuth();
         $this->deleteKeyboard();
-
-        $data = serialize($this->data->toArray());
-
-        $this->chat->message("Укажите сумму платежа")->send();
+        $data = $this->data->toArray();
+        $text = "Укажите сумму платежа\n(Для отмены напишите /cancel)";
+        $this->chat->edit($data['pMsg'])->message($text)->send();
+        NextMessageService::addNextStepHandler($this->chat->chat_id, serialize($data), 'handleSum');
 
     }
+    protected function handleSum(array $data, string $text): void
+    {
+        $this->chat->deleteMessage($data['pMsg']);
+
+        if (!is_numeric($text)) {
+            $this->chat->message("Ошибка: вы ввели не целое число.")->send();
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, 'handleSum');
+            die();
+        }
+        $data['sum'] = $text;
+
+        $this->chat->message("Укажите дату (формат: гггг мм дд чч мм сс). Например 2024 12 30 12 00 00\n(Для отмены напишите /cancel)")
+        ->send();
+        $data['pMsg'] = $this->message->id();
+        NextMessageService::addNextStepHandler($this->chat->chat_id, serialize($data), 'handleDate');
+
+    }
+
+    protected function handleDate(array $data, string $text)
+    {
+
+
+        $format = 'Y m d H i s';
+        $date = DateTime::createFromFormat($format, $text);
+        if (!$text === $date) {
+            $this->chat->edit($data['pMsg'])->message("Ошибка: вы ввели не целое число. Попробуйте еще раз.")->send();
+            NextMessageService::deleteNextStepHandler($this->chat->chat_id, 'handleDate');
+            die();
+        }
+
+        $data = (array) $data;
+
+        $data['date'] = $text;
+        $this->createSchedule($data);
+
+    }
+
+    private function createSchedule(array $data)
+    {
+        $this->checkAuth();
+
+        PaymentSchedule::query()->create([
+            'usurer' => $data['usurer'],
+            'debtor' => $data['debtor'],
+            'debt' => $data['sum'],
+            'date' => $data['date'],
+            'period' => $data['period']
+        ]);
+
+        $this->chat->message('График создан.')->send();
+    }
+
+
+
 
     public function start(string $token = '')
     {
@@ -200,15 +391,23 @@ class Handler extends WebhookHandler
         }
 
         if (empty($incomingStr)) {
-            $incomingStr = "У вас нет входящих платежей.";
+            $incomingStr = "У вас нет входящих платежей.\n\n";
         }
 
         if (empty($outcomingStr)) {
             $outcomingStr = "У вас нет исходящих платежей.";
         }
 
-        $this->reply(sprintf("<b>Входящие переводы:</b>\n%s\n<b>Исходящие переводы:</b>\n%s\n", $incomingStr,
-            $outcomingStr));
+        if (array_key_exists('action', $data = $this->data->toArray())){
+            $this->chat->edit($data['pMsg'])->message(sprintf("<b>Входящие переводы:</b>\n%s\n<b>Исходящие переводы:</b>\n%s\n", $incomingStr,
+                $outcomingStr))->keyboard(Keyboard::make()->buttons([
+                    Button::make('Вернуться в меню')->action('menu')->param('pMsg', $this->messageId)
+            ]))->send();
+            die();
+        }
+
+        $this->chat->message(sprintf("<b>Входящие переводы:</b>\n%s\n<b>Исходящие переводы:</b>\n%s\n", $incomingStr,
+            $outcomingStr))->send();
 
     }
 
@@ -216,34 +415,49 @@ class Handler extends WebhookHandler
     {
         $this->checkAuth();
 
-        $schedules = PaymentSchedule::query()->get();
-        $msg = '';
-        $count = 0;
+        $oneTimePaymentSchedules = PaymentSchedule::query()->where('period', 'once')->get();
+        $monthlyPaymentSchedules = PaymentSchedule::query()->where('period', 'regular')->get();
+        $oneTimeStr = '';
+        $monthlyStr = '';
+        foreach ($oneTimePaymentSchedules as $schedule) {
+            $oneTimeStr .= sprintf("ID:%s %s переводит участнику %s %sр %s числа.\n\n", $schedule->id,
+                Member::query()->find($schedule->debtor)->name, Member::query()->find($schedule->usurer)->name,
+                $schedule->debt, $schedule->date
+            );
+        }
+        foreach ($monthlyPaymentSchedules as $schedule) {
+            $monthlyStr .= sprintf("ID:%s %s переводит участнику %s %sр %s числа каждый месяц.\n\n", $schedule->id,
+                Member::query()->find($schedule->debtor)->name, Member::query()->find($schedule->usurer)->name,
+                $schedule->debt, $schedule->date->format('d'));
 
-        foreach ($schedules as $schedule) {
-            $count++;
-            $msg .= sprintf("%s. %s переводит участнику %s %sр.\n", $count,
-                Member::query()->find($schedule->debtor)->name,
-                Member::query()->find($schedule->usurer)->name, $schedule->debt);
+
         }
 
-        if (empty($msg)) {
-            $msg = "Графики платежей пусты.";
+        if (empty($oneTimeStr)) {
+            $oneTimeStr = "Одноразовые платежи отсутствуют\n\n";
+        }
+        if (empty($monthlyStr)) {
+            $oneTimeStr = "Ежемесячные платежи отсутствуют\n\n";
         }
 
-        $this->reply($msg);
+        $this->chat->message("<b>Одноразовые платежи:</b>\n{$oneTimeStr}<b>Ежемесячные платежи:</b>\n{$monthlyStr}")->send();
+
 
     }
 
     public function check()
     {
+        die();
+
         $this->checkAuth();
 
-        $this_member = Member::query()->where('chat_id', $this->chat->chat_id)->first();
+        $data = $this->data->toArray();
+
+        $thisMember = Member::query()->where('chat_id', $this->chat->chat_id)->first();
 
         $waitingPayments = Payment::query()->where([
             ['status', '=', 'waiting'],
-            ['member_id', '=', $this_member->id]
+            ['member_id', '=', $thisMember->id]
         ])->get();
 
         $paymentsStr = '';
@@ -259,36 +473,43 @@ class Handler extends WebhookHandler
             $paymentsStr = 'У вас нет задолженностей.';
         }
 
+        if (array_key_exists('action', $data)){
+            $this->chat->edit($data['pMsg'])->message($paymentsStr)->keyboard(
+                Keyboard::make()->buttons([
+                    Button::make('Вернуться в меню')->action('menu')->param('pMsg', $data['pMsg'])
+                ])
+            )->send();
+
+            die();
+        }
+
+
         $this->reply($paymentsStr);
     }
 
 
-    public function add()
-    {
-
-
-        $members = Member::query()->get();
-        $buttons = [];
-        foreach ($members as $member) {
-
-            $buttons[] = Button::make("{$member->name} {$member->surname}")->action('selectDebtor')
-                ->param('usurer', $member->id);
-
-        }
-
-
-        $this->chat->message("Укажите платильщика")->keyboard(Keyboard::make()->buttons($buttons))->send();
-    }
 
     public function del()
     {
-        $this->reply("Данная команда еще не реализована в боте, но скоро мы её добавим!");
+        $this->checkAuth();
+
+        $this->scheduleAll();
+
+        $this->reply("Укажите ID графика, который вы хотите удалить.\n(Для отмены напишите в чат /cancel)");
+
+        NextMessageService::addNextStepHandler($this->chat->chat_id, serialize([]), 'deleteSchedule');
     }
 
-    public function edit()
-    {
-        $this->reply("Данная команда еще не реализована в боте, но скоро мы её добавим!");
+    public function cancel(){
+
+        $this->checkAuth();
+
+        NextMessageService::deleteAllHandlersForChat($this->chat->chat_id);
+        $this->reply("Действие прервано. Чем еще могу Вам помочь?");
+        die();
+
     }
+
 
 
 }

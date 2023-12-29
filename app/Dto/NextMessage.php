@@ -4,32 +4,28 @@ namespace App\Dto;
 
 class NextMessage
 {
-    /**
-     * @var callable
-     */
-    private $handler;
+    private string $command;
     private array $data;
 
-    public function __construct(callable $handler, array $data)
+
+
+    public function __construct(string $command, array $data)
     {
 
-        $this->handler = $handler;
+        $this->command = $command;
         $this->data = $data;
+
     }
 
-    /**
-     * @return array
-     */
+
+
     public function getData(): array
     {
         return $this->data;
     }
 
-    /**
-     * @return callable
-     */
-    public function getHandler(): callable
+    public function getAction(): string
     {
-        return $this->handler;
+        return $this->command;
     }
 }
